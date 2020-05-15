@@ -1,9 +1,10 @@
 package lock
 
 import (
-	"github.com/go-redis/redis"
 	"testing"
 	"time"
+
+	"github.com/go-redis/redis"
 )
 
 func TestRedisLock(t *testing.T) {
@@ -27,6 +28,7 @@ func TestRedisLock(t *testing.T) {
 	if success {
 		t.Fatal("lock expected success:false, got:true")
 	}
+	time.Sleep(time.Minute)
 	unlock()
 	unlock, success, err = lock.Lock("test", time.Minute)
 

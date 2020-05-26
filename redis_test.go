@@ -12,7 +12,7 @@ func TestRedisLock(t *testing.T) {
 		Addr: "127.0.0.1:6379",
 	})
 	lock := NewRedisLock(client)
-	unlock, success, err := lock.Lock("test", time.Minute)
+	unlock, success, err := lock.Lock("test", time.Second*3, nil)
 
 	if err != nil {
 		t.Fatalf("lock expected err:nil, got:%#v", err)
@@ -20,7 +20,7 @@ func TestRedisLock(t *testing.T) {
 	if !success {
 		t.Fatal("lock expected success:true, got:false")
 	}
-	_, success, err = lock.Lock("test", time.Minute)
+	_, success, err = lock.Lock("test", time.Second*3, nil)
 
 	if err != nil {
 		t.Fatalf("lock expected err:nil, got:%#v", err)
@@ -28,9 +28,9 @@ func TestRedisLock(t *testing.T) {
 	if success {
 		t.Fatal("lock expected success:false, got:true")
 	}
-	time.Sleep(time.Minute)
+	time.Sleep(time.Second * 3)
 	unlock()
-	unlock, success, err = lock.Lock("test", time.Minute)
+	unlock, success, err = lock.Lock("test", time.Second*3, nil)
 
 	if err != nil {
 		t.Fatalf("lock expected err:nil, got:%#v", err)

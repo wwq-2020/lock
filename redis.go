@@ -39,7 +39,7 @@ func NewRedisLock(client *redis.Client) Locker {
 	return &redisLock{client: client}
 }
 
-func (l *redisLock) Lock(key string, ttl time.Duration) (func() error, bool, error) {
+func (l *redisLock) Lock(key string, ttl time.Duration, onLost func()) (func() error, bool, error) {
 	reqID := fmt.Sprintf("%d-%d-%d", time.Now().UnixNano(), pid, atomic.AddUint64(&seq, 1))
 	success, err := l.client.SetNX(key, reqID, ttl).Result()
 	if err != nil {
@@ -50,20 +50,40 @@ func (l *redisLock) Lock(key string, ttl time.Duration) (func() error, bool, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
+		timer := time.NewTimer(ttl)
+		defer timer.Stop()
+
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		defer cancel()
+		onLost = func() {
+			if onLost != nil {
+				onLost()
+			}
+		}
+
 		for {
 			ok, err := l.client.Eval(redisRenewScript, []string{key}, reqID, 60).Int()
 			if err != nil {
-				time.Sleep(time.Second)
+				select {
+				case <-timer.C:
+					onLost()
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
 				continue
 			}
 			if ok == 0 {
-				cancel()
+				onLost()
 				return
 			}
 			select {
 			case <-ctx.Done():
+				return
+			case <-timer.C:
+				onLost()
 				return
 			case <-ticker.C:
 			}

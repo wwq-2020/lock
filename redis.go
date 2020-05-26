@@ -42,14 +42,14 @@ func NewRedisLock(client *redis.Client) Locker {
 	return &redisLock{client: client}
 }
 
-func (l *redisLock) Lock(key string, ttl time.Duration, onLost func()) (func() error, bool, error) {
+func (l *redisLock) Lock(key string, ttl time.Duration, onLost func()) (func() error, error) {
 	reqID := fmt.Sprintf("%d-%d-%d", time.Now().UnixNano(), pid, atomic.AddUint64(&seq, 1))
 	success, err := l.client.SetNX(key, reqID, ttl).Result()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if !success {
-		return nil, false, nil
+		return nil, ErrConcurrentConflict
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -95,19 +95,18 @@ func (l *redisLock) Lock(key string, ttl time.Duration, onLost func()) (func() e
 	return func() error {
 		cancel()
 		return l.client.Eval(redisUnlockScript, []string{key}, reqID).Err()
-	}, true, nil
+	}, nil
 }
 
 func (l *redisLock) DoInLock(rawCtx context.Context, key string, ttl time.Duration, handler func(ctx context.Context) error) error {
 	ctx, cancel := context.WithCancel(rawCtx)
 	defer cancel()
-	unlock, success, err := l.Lock(key, ttl, cancel)
+	unlock, err := l.Lock(key, ttl, cancel)
+	defer unlock()
 	if err != nil {
 		return err
 	}
-	if !success {
-		return ErrConcurrentConflict
-	}
+
 	defer unlock()
 	if err := handler(ctx); err != nil {
 		return err

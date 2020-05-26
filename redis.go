@@ -2,6 +2,7 @@ package lock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -27,6 +28,8 @@ return 0
 `
 	pid = os.Getpid()
 	seq uint64
+	// ErrConcurrentConflict ErrConcurrentConflict
+	ErrConcurrentConflict = errors.New("ErrConcurrentConflict")
 )
 
 // redisLock redis锁
@@ -93,4 +96,21 @@ func (l *redisLock) Lock(key string, ttl time.Duration, onLost func()) (func() e
 		cancel()
 		return l.client.Eval(redisUnlockScript, []string{key}, reqID).Err()
 	}, true, nil
+}
+
+func (l *redisLock) DoInLock(rawCtx context.Context, key string, ttl time.Duration, handler func(ctx context.Context) error) error {
+	ctx, cancel := context.WithCancel(rawCtx)
+	defer cancel()
+	unlock, success, err := l.Lock(key, ttl, cancel)
+	if err != nil {
+		return err
+	}
+	if !success {
+		return ErrConcurrentConflict
+	}
+	defer unlock()
+	if err := handler(ctx); err != nil {
+		return err
+	}
+	return nil
 }

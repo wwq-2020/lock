@@ -102,11 +102,9 @@ func (l *redisLock) DoInLock(rawCtx context.Context, key string, ttl time.Durati
 	ctx, cancel := context.WithCancel(rawCtx)
 	defer cancel()
 	unlock, err := l.Lock(key, ttl, cancel)
-	defer unlock()
 	if err != nil {
 		return err
 	}
-
 	defer unlock()
 	if err := handler(ctx); err != nil {
 		return err

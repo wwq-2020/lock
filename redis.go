@@ -2,16 +2,22 @@ package lock
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"os"
-	"sync/atomic"
 	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
+	redisLockScript = `
+local prev = redis.call("get", KEYS[1]);
+if (prev == false) then
+	return redis.call("set", KEYS[1], ARGV[1], "ex", ARGV[2]);
+end
+if (prev == ARGV[1]) then
+	return redis.call("set", KEYS[1], ARGV[1], "ex", ARGV[2]);
+end
+return "FAIL"
+`
 	redisUnlockScript = `
 local prev = redis.call("get", KEYS[1]);
 if (prev ~= false and prev == ARGV[1]) then
@@ -26,13 +32,9 @@ if (prev ~= false and prev == ARGV[1]) then
 end
 return 0
 `
-	pid = os.Getpid()
-	seq uint64
-	// ErrConcurrentConflict ErrConcurrentConflict
-	ErrConcurrentConflict = errors.New("ErrConcurrentConflict")
 )
 
-// redisLock redis锁
+// redisLock redis lock
 type redisLock struct {
 	client *redis.Client
 }
@@ -42,66 +44,133 @@ func NewRedisLock(client *redis.Client) Locker {
 	return &redisLock{client: client}
 }
 
-func (l *redisLock) Lock(key string, ttl time.Duration, onLost func()) (func() error, error) {
-	reqID := fmt.Sprintf("%d-%d-%d", time.Now().UnixNano(), pid, atomic.AddUint64(&seq, 1))
-	success, err := l.client.SetNX(key, reqID, ttl).Result()
+func (l *redisLock) doLock(key, value string, expirationSeconds int, options Options) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.TODO(), options.timeout)
+	defer cancel()
+
+	result, err := l.client.Eval(ctx, redisLockScript, []string{key}, value, expirationSeconds).Result()
 	if err != nil {
-		return nil, err
+		return false, err
+	}
+	resultInt := result.(string)
+	return resultInt == "OK", nil
+
+}
+
+func (l *redisLock) doRenew(key, value string, expiration int, options Options) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.TODO(), options.timeout)
+	defer cancel()
+
+	result, err := l.client.Eval(ctx, redisRenewScript, []string{key}, value, expiration).Result()
+	if err != nil {
+		return false, err
+	}
+	resultInt := result.(int64)
+	return resultInt == 1, nil
+}
+
+func (l *redisLock) doUnlock(key, value string, options Options) error {
+	ctx, cancel := context.WithTimeout(context.TODO(), options.timeout)
+	defer cancel()
+	if err := l.client.Eval(ctx, redisUnlockScript, []string{key}, value).Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (l *redisLock) TryLock(key string, expirationSeconds int, onLost func(), opts ...Option) (bool, func() error, error) {
+	if expirationSeconds <= 0 {
+		expirationSeconds = defaultExpirationSeconds
+	}
+
+	options := defaultOptions()
+	options.apply(opts...)
+
+	expiration := time.Duration(expirationSeconds) * time.Second
+	renewInterval := expiration / 4
+	reqID := options.idGenerator()
+	success, err := l.doLock(key, reqID, expirationSeconds, options)
+	if err != nil {
+		return false, nil, err
 	}
 	if !success {
-		return nil, ErrConcurrentConflict
+		return false, nil, nil
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		timer := time.NewTimer(ttl)
-		defer timer.Stop()
 
-		ticker := time.NewTicker(time.Second)
+	ctxUnlock, unLockCtxCancelFunc := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(renewInterval)
 		defer ticker.Stop()
-		defer cancel()
-		onLost = func() {
+		curOnLost := func() {
 			if onLost != nil {
 				onLost()
 			}
 		}
 
-		for {
-			ok, err := l.client.Eval(redisRenewScript, []string{key}, reqID, 60).Int()
-			if err != nil {
-				select {
-				case <-timer.C:
-					onLost()
-					return
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-				}
-				continue
-			}
-			if ok == 0 {
-				onLost()
-				return
-			}
+		for range ticker.C {
 			select {
-			case <-ctx.Done():
+			case <-ctxUnlock.Done():
 				return
-			case <-timer.C:
-				onLost()
-				return
-			case <-ticker.C:
+			default:
+				success, err := l.doRenew(key, reqID, expirationSeconds, options)
+				if err != nil {
+					continue
+				}
+				if !success {
+					curOnLost()
+					return
+				}
 			}
 		}
 	}()
-	return func() error {
-		cancel()
-		return l.client.Eval(redisUnlockScript, []string{key}, reqID).Err()
+	return true, func() error {
+		unLockCtxCancelFunc()
+		if err := l.doUnlock(key, reqID, options); err != nil {
+			return err
+		}
+		return nil
 	}, nil
 }
 
-func (l *redisLock) DoInLock(rawCtx context.Context, key string, ttl time.Duration, handler func(ctx context.Context) error) error {
-	ctx, cancel := context.WithCancel(rawCtx)
+func (l *redisLock) Lock(key string, expirationSeconds int, onLost func(), opts ...Option) (func() error, error) {
+	options := defaultOptions()
+	options.apply(opts...)
+	for {
+		success, unlock, err := l.TryLock(key, expirationSeconds, onLost, opts...)
+		if err != nil {
+			return nil, err
+		}
+		if success {
+			return unlock, nil
+		}
+		time.Sleep(options.retryInterval)
+	}
+}
+
+func (l *redisLock) LockContext(ctx context.Context, key string, expirationSeconds int, onLost func(), opts ...Option) (func() error, error) {
+	options := defaultOptions()
+	options.apply(opts...)
+	for {
+		success, unlock, err := l.TryLock(key, expirationSeconds, onLost, opts...)
+		if err != nil {
+			return nil, err
+		}
+		if success {
+			return unlock, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		time.Sleep(options.retryInterval)
+	}
+}
+
+func (l *redisLock) InLock(key string, expirationSeconds int, handler func(ctx context.Context) error, opts ...Option) error {
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	unlock, err := l.Lock(key, ttl, cancel)
+	unlock, err := l.Lock(key, expirationSeconds, cancel, opts...)
 	if err != nil {
 		return err
 	}
@@ -110,4 +179,52 @@ func (l *redisLock) DoInLock(rawCtx context.Context, key string, ttl time.Durati
 		return err
 	}
 	return nil
+}
+
+func (l *redisLock) InLockContext(ctx context.Context, key string, expirationSeconds int, handler func(ctx context.Context) error, opts ...Option) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	unlock, err := l.LockContext(ctx, key, expirationSeconds, cancel, opts...)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := handler(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (l *redisLock) TryInLock(key string, expirationSeconds int, handler func(ctx context.Context) error, opts ...Option) (bool, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	success, unlock, err := l.TryLock(key, expirationSeconds, cancel, opts...)
+	if err != nil {
+		return false, err
+	}
+	if !success {
+		return false, nil
+	}
+	defer unlock()
+	if err := handler(ctx); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (l *redisLock) TryInLockContext(ctx context.Context, key string, expirationSeconds int, handler func(ctx context.Context) error, opts ...Option) (bool, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	success, unlock, err := l.TryLock(key, expirationSeconds, cancel, opts...)
+	if err != nil {
+		return false, err
+	}
+	if !success {
+		return false, nil
+	}
+	defer unlock()
+	if err := handler(ctx); err != nil {
+		return true, err
+	}
+	return true, nil
 }

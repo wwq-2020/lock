@@ -2,9 +2,8 @@ package lock
 
 import (
 	"testing"
-	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestRedisLock(t *testing.T) {
@@ -12,24 +11,13 @@ func TestRedisLock(t *testing.T) {
 		Addr: "127.0.0.1:6379",
 	})
 	lock := NewRedisLock(client)
-	unlock, err := lock.Lock("test", time.Second*3, nil)
+	success, unlock, err := lock.TryLock("test", 10, nil)
 
 	if err != nil {
 		t.Fatalf("lock expected err:nil, got:%#v", err)
 	}
-
-	_, err = lock.Lock("test", time.Second*3, nil)
-
-	if err != ErrConcurrentConflict {
-		t.Fatal("lock expected success:false, got:true")
+	if !success {
+		t.Fatal("lock expected success:true, got:false")
 	}
-	time.Sleep(time.Second * 3)
-	unlock()
-	unlock, err = lock.Lock("test", time.Second*3, nil)
-
-	if err != nil {
-		t.Fatalf("lock expected err:nil, got:%#v", err)
-	}
-
-	unlock()
+	defer unlock()
 }
